@@ -1,0 +1,356 @@
+import discord
+import sqlite3
+import requests
+from bs4 import BeautifulSoup
+from discord.ext import commands, tasks
+
+# Bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='g/', intents=intents)
+
+# Database setup
+conn = sqlite3.connect('user_data.db')
+c = conn.cursor()
+c.execute('''
+    CREATE TABLE IF NOT EXISTS user_behavior (
+        user_id TEXT, 
+        behavior TEXT,
+        response TEXT
+    )
+''')
+c.execute('''
+    CREATE TABLE IF NOT EXISTS user_stats (
+        user_id TEXT PRIMARY KEY,
+        total_requests INTEGER DEFAULT 0,
+        most_requested_game TEXT,
+        favourite_game TEXT
+    )
+''')
+conn.commit()
+
+# Create a table to store game requests
+c.execute("""
+    CREATE TABLE IF NOT EXISTS game_requests (
+        user_id TEXT,
+        game_name TEXT,
+        requests INTEGER,
+        PRIMARY KEY (user_id, game_name)
+    );
+""")
+
+# Function to log user behavior
+def log_user_behavior(user_id, behavior, response):
+    c.execute("INSERT INTO user_behavior (user_id, behavior, response) VALUES (?, ?, ?)", 
+              (user_id, behavior, response))
+    conn.commit()
+    print(f"Inserted data into user_behavior table: user_id={user_id}, behavior={behavior}")
+
+# Function to update user statistics
+def update_user_stats(user_id, game_name):
+    # Update total requests
+    c.execute("INSERT OR IGNORE INTO user_stats (user_id) VALUES (?)", (user_id,))
+    c.execute("UPDATE user_stats SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
+
+     # Create a new row for the game if it doesn't exist, or update the existing row
+    c.execute("""
+        INSERT INTO game_requests (user_id, game_name, requests)
+        VALUES (?, ?, 1)
+        ON CONFLICT (user_id, game_name) DO UPDATE SET requests = requests + 1
+    """, (user_id, game_name))
+
+    # Update most requested game
+    c.execute("""
+        UPDATE user_stats
+        SET most_requested_game = (
+            SELECT game_name
+            FROM game_requests
+            WHERE user_id = ?
+            ORDER BY requests DESC
+            LIMIT 1
+        )
+        WHERE user_id = ?;
+    """, (user_id, user_id))
+
+    conn.commit()
+
+# Function to get user info
+def get_user_info(user_id):
+    c.execute("SELECT * FROM user_stats WHERE user_id = ?", (user_id,))
+    user_info = c.fetchone()
+    return user_info
+
+# Function to delete user info
+def delete_user_info(user_id):
+    c.execute("DELETE FROM user_stats WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+# Function to update user info
+def update_favourite(user_id, new_game_name):
+    c.execute("UPDATE user_stats SET favourite_game = ? WHERE user_id = ?", (new_game_name, user_id))
+    conn.commit()
+
+# Event for bot startup
+@bot.event
+async def on_ready():
+    print(f'We have logged in as {bot.user}')
+
+# Event to handle incoming messages
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    await bot.process_commands(message)
+
+# Command to get game information
+@bot.command()
+async def game_info(ctx, *, game_name):
+    game_websites = {
+        "league of legends": "https://www.leagueoflegends.com/en-us/how-to-play/",
+        "valorant": "https://playvalorant.com/en-us/news/announcements/beginners-guide/"
+    }
+    
+    game_name_lower = game_name.lower()
+    
+    if game_name_lower in game_websites:
+        url = game_websites[game_name_lower]
+        response = requests.get(url)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Adjust according to the actual website structure.
+        if game_name_lower == "league of legends":
+            guide_section = soup.find('div', {'data-testid': 'description'})  # Adjust based on actual HTML structure
+            if guide_section:
+                result = guide_section.text.strip()
+            else:
+                result = "Could not find the guide section on the League of Legends page."
+        elif game_name_lower == "valorant":
+            guide_section = soup.find('section', {'data-testid': 'ArticleRichTextBlade'})  # Adjust based on actual HTML structure
+            if guide_section:
+                result = guide_section.text.strip()
+            else:
+                result = "Could not find the guide section on the Valorant page."
+
+        await ctx.send(result)
+        log_user_behavior(ctx.author.id, ctx.message.content, result)
+        update_user_stats(ctx.author.id, game_name_lower)
+    else:
+        result = "Sorry, I don't have information on that game. Use g/list_games to see all available games.\nUse g/favourite to enter your favourite game, we might add it in the future!"
+        await ctx.send(result)
+        log_user_behavior(ctx.author.id, ctx.message.content, result)
+
+# Command to get user info
+@bot.command()
+async def get_info(ctx):
+    user_info = get_user_info(ctx.author.id)
+    if user_info:
+        await ctx.send(f"User ID: {user_info[0]}\nTotal Requests: {user_info[1]}\nMost Requested Game: {user_info[2]}")
+    else:
+        await ctx.send("No information found for this user.")
+
+# Command to delete user info
+@bot.command()
+async def delete_info(ctx):
+    delete_user_info(ctx.author.id)
+    await ctx.send("Your information has been deleted.")
+
+# Command to update user info
+@bot.command()
+async def favourite(ctx, new_game_name):
+    update_favourite(ctx.author.id, new_game_name.lower())
+    await ctx.send("Your favourite game has been updated to " + new_game_name + ".")
+
+
+#help command
+bot.remove_command('help')
+@bot.command(name='help')
+async def help(ctx):
+    embed = discord.Embed(title="Available Commands", color=0x00ff00)
+
+    embed.add_field(name="g/help", value="Displays this help message", inline=False)
+
+    embed.add_field(name="g/list_games", value="Lists out all available games in this bot", inline=False)
+
+    embed.add_field(name="g/game_info", value="Use g/game_info <game_name> to get information about a specific game. \nFor Example: 'g/game_info Valorant'", inline=False)
+
+    embed.add_field(name="g/check_updates",
+                    value="Use g/check_updates <game_name> to check for updates on a specific game. \nFor Example: 'g/check_updates Valorant'\nGitGud will continue to check for updates every 5 minutes", inline=False)
+
+    embed.add_field(name="g/searchInfo", value="Use to search for keywords in a specific game. \nFor Example: 'g/searchInfo Valorant'\nGitGud will ask you what do you want to find in the game", inline=False)
+    
+    embed.add_field(name="g/get_info", value="Use g/get_info to get your information", inline=False)
+
+    embed.add_field(name="g/delete_info", value="Use g/delete_info to delete your information", inline=False)
+
+    embed.add_field(name="g/favourite", value="Use g/favourite <game_name> to update your favourite game!\nIn the future, we might add patch note updates for your favourite game.", inline=False)
+    # Send the embed message
+    await ctx.send(embed=embed)
+
+# Command to list games in the bot's library
+@bot.command()
+async def list_games(ctx):
+    game_websites = {
+        "league of legends": "https://www.leagueoflegends.com/en-us/how-to-play/",
+        "valorant": "https://playvalorant.com/en-us/news/announcements/beginners-guide/"
+    }
+    games_list = ', '.join(game_websites.keys())
+    await ctx.send(f"The games included in the library are: {games_list}")
+
+# patch update commands
+val_channel_id = None
+league_channel_id = None
+@bot.command()
+async def check_updates(ctx, *, game_name):
+    global val_channel_id, league_channel_id
+    games = {"valorant", "league of legends"}
+
+    if game_name.lower() in games:
+        await ctx.send("Please enter the channel ID of the channel where you want to receive updates.")
+        try:
+            channel_id = await bot.wait_for("message", check=lambda message: message.author == ctx.author, timeout=60)
+            channel_id = channel_id.content
+
+            channel = bot.get_channel(int(channel_id))
+            if channel is None:
+                await ctx.send("Invalid channel ID. Please right click and copy channel id from your channel.\nOr check you permissions to access the channel id.")
+                return
+            if game_name.lower() == "valorant":
+                val_channel_id = channel_id
+                check_val.start()
+                result = ("Checking for Valorant updates...")
+            elif game_name.lower() == "league of legends":
+                league_channel_id = channel_id
+                check_league.start()
+                result = ("Checking for League of Legends updates...")
+            await ctx.send(result)
+
+        except asyncio.TimeoutError:
+            await ctx.send("Timed out for entering the channel ID.. Please try again.")
+        log_user_behavior(ctx.author.id, ctx.message.content, result)
+        update_user_stats(ctx.author.id, game_name.lower())
+    else:
+        result =("Invalid game name. Please use g/list_games to see all available games.\nUse g/favourite to enter your favourite game, we might add it in the future!")
+        log_user_behavior(ctx.author.id, ctx.message.content, result)
+
+
+last_val_link = None
+@tasks.loop(minutes=5)
+async def check_val():
+    global last_val_link, val_channel_id
+    if val_channel_id is None:
+        print("Error: val_channel_id is None")
+        return
+
+    channel = bot.get_channel(int(val_channel_id))
+    if channel is None:
+        print(f"Error: Channel {val_channel_id} does not exist")
+        return
+
+    url = "https://playvalorant.com/en-us/news/tags/patch-notes/"
+
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, "html.parser")
+
+    first_patch = soup.select_one("a")
+
+    if first_patch:
+        patch_link = "https://playvalorant.com" + first_patch.get("href")
+        desc = first_patch.get("aria-label")
+
+        if last_val_link != patch_link:
+            last_val_link = patch_link
+            
+            embed = discord.Embed(title="Latest Patch Notes", description=desc, color=discord.Color.red())
+            embed.set_image(url="https://freight.cargo.site/w/3840/q/75/i/a17dfc0b27e50cb1c75dcd8fcd13a2d11783729f60265d9a00d184bc5a8d9296/VALORANT_1.png")
+            embed.add_field(name="Latest Patch Note Link", value=f"[Click Here]({patch_link})", inline=False)
+
+            await channel.send("@valo A new patch has been released!", embed=embed)
+        else:
+            print("No new patch.")
+    else:
+        print("Unable to find patch.")
+
+last_league_link = None
+@tasks.loop(minutes=5)
+async def check_league():
+    global last_league_link, league_channel_id
+    if league_channel_id is None:
+        print("Error: val_channel_id is None")
+        return
+
+    channel = bot.get_channel(int(league_channel_id))
+    if channel is None:
+        print(f"Error: Channel {league_channel_id} does not exist")
+        return
+
+    url = "https://www.leagueoflegends.com/en-us/news/tags/patch-notes/"
+
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, "html.parser")
+
+    first_patch = soup.select_one("a")
+
+    if first_patch:
+        patch_link = "https://www.leagueoflegends.com" + first_patch.get("href")
+        desc = first_patch.get("aria-label")
+
+        if last_league_link != patch_link:
+            last_league_link = patch_link
+            embed = discord.Embed(title="Latest Patch Notes", description=desc, color=discord.Color.blue())
+            embed.set_image(url="https://lorenzofanton.com/wp-content/uploads/2020/07/LOL_LF_%E2%8D%9F_1-3000x1688.jpg")
+            embed.add_field(name="Latest Patch Note Link", value=f"[Click Here]({patch_link})", inline=False)
+
+            await channel.send("@league A new patch has been released!", embed=embed)
+        else:
+            print("No new patch.")
+    else:
+        print("Unable to find patch.")
+
+#search command
+@bot.command()
+async def searchInfo(ctx, *, game_name):
+    websites = {
+        "league of legends": "https://www.leagueoflegends.com/en-us/how-to-play/",
+        "valorant": "https://playvalorant.com/en-us/news/announcements/beginners-guide/"
+        }
+    
+    if game_name.lower() in websites:
+        url = websites[game_name.lower()]
+        response = requests.get(url)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        result = (f"What would you like to search for in {game_name}?")
+        await ctx.send(result)
+        search_input = await bot.wait_for("message", check=lambda message: message.author == ctx.author, timeout=60)
+        search_input = search_input.content
+        
+        log_user_behavior(ctx.author.id, ctx.message.content, result)
+        update_user_stats(ctx.author.id, game_name.lower())
+    
+        user_respond = ""
+        while user_respond.lower() != "no":
+            element = soup.find(lambda tag: tag.name =='p' and (search_input.lower() in tag.text.lower() or f" {search_input.lower()} " in f" {tag.text.lower()}"))
+            if(element):
+                text = element.get_text()
+                await ctx.send(text)
+                await ctx.send(f"Is there anything else you would like to search in {game_name}? If not, please type 'no'.")
+                user_respond = await bot.wait_for("message", check=lambda message: message.author == ctx.author, timeout=60)
+                user_respond = user_respond.content
+                if (user_respond.lower() != "no"):
+                    search_input = user_respond
+                else:
+                    await ctx.send("Okay, stopped searching. \nIf you would like to search again, please type 'g/searchInfo <game_name>'.")
+
+            else:
+                await ctx.send(f"We cant find anything about {search_input} in {game_name}")
+                await ctx.send("Please try entering a different search term")
+                await ctx.send("Try words that are general, Example: weapon instead of weapons")
+                search_input = await bot.wait_for("message", check=lambda message: message.author == ctx.author, timeout=60)
+                search_input = search_input.content
+
+    else:
+        result = ("We do not have that game in our library. Please use g/list_games to see the games we have.")
+        await ctx.send(result)
+        log_user_behavior(ctx.author.id, ctx.message.content, result)
+
+bot.run('Bot Token')
