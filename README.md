@@ -26,5 +26,5 @@ g/check_updates: accepts a game name and channel id to check for game updates fr
 
 g/searchInfo: accepts a game name followed by keyword to search for in the websites.
 
-Discord Bot's Token is not given.
+Discord Bot's Token is not given, insert your own bot token.
 
